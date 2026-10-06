@@ -109,10 +109,8 @@ PartsRanges FluidLSMMergeSelector::select(
     std::vector<PartsRange> explicit_ranges;
 
     /// Partitions where a lower level overflowed: the merge range is chosen
-    /// by SimpleMergeSelector. The partitions themselves are needed for the
-    /// same-level fallback if the scan finds nothing there.
+    /// by SimpleMergeSelector.
     PartsRanges delegated;
-    std::unordered_map<String, const PartsRange *> overflowed_partitions;
 
     for (const PartsRange & parts : parts_ranges)
     {
@@ -225,10 +223,7 @@ PartsRanges FluidLSMMergeSelector::select(
         /// bound. Simple decides what to merge, so the partition is delegated.
         if (std::any_of(level_counts.begin(), level_counts.end(),
                 [&](const auto & kv) { return kv.first != max_level && kv.second > settings.max_parts_at_lower_levels; }))
-        {
             delegated.push_back(parts);
-            overflowed_partitions.emplace(partition_id, &parts);
-        }
     }
 
     /// Bound enforcement takes the largest merge constraints first.
@@ -247,36 +242,47 @@ PartsRanges FluidLSMMergeSelector::select(
 
     /// Simple picks the merge ranges in the overflowing partitions. Its own
     /// estimator scores the windows, keeps the results disjoint and fits them
-    /// into the remaining constraints.
+    /// into the remaining constraints. Ranges are tracked individually: the
+    /// same partition can appear in several parts ranges when the merge
+    /// predicate splits it, and a range Simple did not cover still needs the
+    /// same-level fallback.
+    std::vector<bool> covered(delegated.size(), false);
     if (!delegated.empty() && constraints_used < merge_constraints.size())
     {
+        std::unordered_map<String, size_t> range_index_by_part_name;
+        for (size_t i = 0; i < delegated.size(); ++i)
+            for (const auto & part : delegated[i])
+                range_index_by_part_name.emplace(part.name, i);
+
         for (auto & range : SimpleMergeSelector(settings.simple).select(
                  delegated, merge_constraints.subspan(constraints_used), range_filter))
         {
-            overflowed_partitions.erase(range.front().info.getPartitionId());
+            covered[range_index_by_part_name.at(range.front().name)] = true;
             result.push_back(std::move(range));
             ++constraints_used;
         }
     }
 
-    /// If Simple found nothing in an overflowing partition - for example the
+    /// If Simple found nothing in an overflowing range - for example the
     /// overflowing runs are too small to pass its size-ratio check - merge the
     /// same-level runs so a level can never be stuck over its bound.
-    for (const auto & [_, parts] : overflowed_partitions)
+    for (size_t i = 0; i < delegated.size(); ++i)
     {
-        if (constraints_used >= merge_constraints.size())
-            break;
+        if (covered[i] || constraints_used >= merge_constraints.size())
+            continue;
+
+        const PartsRange & parts = delegated[i];
 
         std::unordered_map<UInt32, size_t> level_counts;
         UInt32 max_level = 0;
-        for (const auto & part : *parts)
+        for (const auto & part : parts)
         {
             ++level_counts[part.info.level];
             max_level = std::max(max_level, part.info.level);
         }
 
         std::vector<PartsRange> runs;
-        emitLowerLevelRuns(*parts, level_counts, max_level, settings.max_parts_at_lower_levels,
+        emitLowerLevelRuns(parts, level_counts, max_level, settings.max_parts_at_lower_levels,
             nullptr, range_filter, settings.max_parts_to_merge_at_once, runs);
 
         for (auto & run : runs)

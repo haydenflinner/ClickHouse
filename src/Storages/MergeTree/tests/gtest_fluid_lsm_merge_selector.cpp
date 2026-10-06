@@ -432,6 +432,52 @@ TEST(FluidLSMMergeSelector, ForceMergeByPartitionAge)
     ASSERT_EQ(selected[0].size(), 3);
 }
 
+/// The merge predicate can split one partition into several parts ranges.
+/// The same-level fallback applies to each range that the delegated Simple
+/// scan did not cover, not just once per partition.
+TEST(FluidLSMMergeSelector, FallbackIsPerRangeNotPerPartition)
+{
+    FluidLSMMergeSelector::Settings settings;
+    settings.max_parts_at_lower_levels = 2;
+    settings.max_parts_at_largest_level = 100;
+    disableWidthHeuristic(settings);
+
+    FluidLSMMergeSelector selector(settings);
+
+    /// Two ranges of the same partition with disjoint parts (as produced by
+    /// splitByMergePredicate). In the first one the overflowing level-0 run
+    /// is too small to pass Simple's ratio check, while the second one is
+    /// merged by Simple itself.
+    PartsRanges ranges;
+    {
+        auto descs = level0Parts(1, 3);
+        descs.push_back(PartDesc{.min_block = 4, .max_block = 10, .level = 9});
+        ranges.push_back(makePartsRange(descs));
+    }
+    {
+        auto descs = level0Parts(100, 20);
+        descs.push_back(PartDesc{.min_block = 120, .max_block = 130, .level = 9});
+        ranges.push_back(makePartsRange(descs));
+    }
+
+    auto selected = selector.select(ranges, makeConstraints(100 * GiB, 100000, 2), nullptr);
+    ASSERT_EQ(selected.size(), 2);
+    /// One range is the wide delegated merge, the other is the fallback run
+    /// of the three level-0 parts.
+    size_t fallback_count = 0;
+    for (const auto & range : selected)
+    {
+        EXPECT_GE(range.size(), 3);
+        if (range.size() == 3)
+        {
+            ++fallback_count;
+            for (const auto & part : range)
+                EXPECT_EQ(part.info.level, 0);
+        }
+    }
+    EXPECT_EQ(fallback_count, 1);
+}
+
 /// Merge candidates never cross a partition boundary.
 TEST(FluidLSMMergeSelector, PartitionBoundariesAreRespected)
 {
