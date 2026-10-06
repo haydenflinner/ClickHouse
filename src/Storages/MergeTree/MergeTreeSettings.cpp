@@ -1063,7 +1063,51 @@ table can have a superset of the source table's indices and projections.
         {"24.12", true, false, "New setting"}) \
     DECLARE(MergeSelectorAlgorithm, merge_selector_algorithm, MergeSelectorAlgorithm::SIMPLE, R"(
 The algorithm to select parts for merges assignment
+
+Possible values:
+- `Simple` - the default heuristic algorithm. It slides a window over the parts
+  of a partition and allows a merge when the total size of the range is at
+  least `merge_selector_base` times the size of its largest part; the base is
+  lowered as parts age or the partition fills up. It does not know about levels:
+  part counts per level are emergent rather than bounded, and the ratio check
+  discourages merging a small part into a much larger one until the parts are
+  old enough.
+- `StochasticSimple` - a variant of `Simple` with stochastic sliding.
+- `Trivial` - merges a fixed number of parts at a time.
+- `Manual` - merges are scheduled explicitly with `SYSTEM MERGE` queries.
+- `FluidLSM` - implements the Fluid LSM-tree merge policy from the Dostoevsky
+  paper (Dayan, Idreos, SIGMOD'18). Parts are runs and `MergeTreePartInfo::level`
+  (the number of merges a part has survived) is the LSM-tree level. A merge is
+  scheduled only when a level overflows a hard bound: at most
+  `merge_selector_fluid_lsm_k` parts are kept at each level below the largest
+  one and at most `merge_selector_fluid_lsm_z` parts at the largest level.
+  The level bounds decide when a merge is scheduled; the merge range for an
+  overflowing lower level is chosen by the same size-ratio window scan as
+  `Simple`, so under a merge backlog it picks wide, possibly cross-level
+  windows. Compared to `Simple`, this guarantees a worst-case bound of about
+  `K` * `L` + `Z` parts per partition and merges the lower levels only once
+  they fill up, which lowers write amplification. `merge_selector_fluid_lsm_z`
+  controls how eagerly the largest level compacts: `Z = 1` gives "leveling"
+  (the least stale data and the fewest parts, the most merge work) and larger
+  values trade a bounded number of top-level parts for much less merge work.
 )", EXPERIMENTAL) \
+    DECLARE(UInt64, merge_selector_fluid_lsm_k, 9, R"(
+Bound on the number of parts at each level below the largest level for the
+`FluidLSM` merge selector (parameter `K` of the Fluid LSM-tree merge policy).
+A merge is scheduled when a level accumulates more than this number of parts.
+Merging `K` + 1 parts produces a part of the next level, so `K` + 1 also plays
+the role of the size ratio `T` between adjacent levels.
+)", EXPERIMENTAL, \
+        {"26.10", 9, 9, "New setting"}) \
+    DECLARE(UInt64, merge_selector_fluid_lsm_z, 20, R"(
+Bound on the number of parts at the largest level for the `FluidLSM` merge
+selector (parameter `Z` of the Fluid LSM-tree merge policy). Merging at the
+largest level is the most expensive merging: `Z = 1` levels the top eagerly
+(the fewest parts and the least stale data, the most merge work), while a
+larger `Z` merges the top less often at the cost of up to `Z` parts per
+partition there.
+)", EXPERIMENTAL, \
+        {"26.10", 20, 20, "New setting"}) \
     DECLARE(UInt64, merge_selector_heuristic_to_lower_max_parts_to_merge_at_once_exponent, 5, R"(
 Controls the exponent value used in formulae building lowering curve. Lowering exponent will
 lower merge widths which will trigger increase in write amplification. The reverse is also true.
@@ -3038,23 +3082,34 @@ void MergeTreeSettingsImpl::sanityCheck(size_t background_pool_tasks, bool backg
             background_pool_tasks);
     }
 
-    /// Only the Simple and StochasticSimple selectors read min_partition_age_to_force_merge_seconds,
+    /// Only the Simple, StochasticSimple and FluidLSM selectors read min_partition_age_to_force_merge_seconds,
     /// so only they can pre-empt the whole-partition (final) merge with a regular one.
     const auto merge_selector_algorithm = (*this)[MergeTreeSetting::merge_selector_algorithm].value;
     if ((*this)[MergeTreeSetting::min_partition_age_to_force_merge_seconds]
         && (*this)[MergeTreeSetting::min_age_to_force_merge_on_partition_only]
         && (*this)[MergeTreeSetting::min_age_to_force_merge_seconds]
         && (merge_selector_algorithm == MergeSelectorAlgorithm::SIMPLE
-            || merge_selector_algorithm == MergeSelectorAlgorithm::STOCHASTIC_SIMPLE))
+            || merge_selector_algorithm == MergeSelectorAlgorithm::STOCHASTIC_SIMPLE
+            || merge_selector_algorithm == MergeSelectorAlgorithm::FLUID_LSM))
     {
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
             "Setting 'min_partition_age_to_force_merge_seconds' cannot be combined with "
-            "'min_age_to_force_merge_seconds' + 'min_age_to_force_merge_on_partition_only' under the Simple or "
-            "StochasticSimple merge selector: the latter merges a whole partition at once, and only that merge is "
+            "'min_age_to_force_merge_seconds' + 'min_age_to_force_merge_on_partition_only' under the Simple, "
+            "StochasticSimple or FluidLSM merge selector: the latter merges a whole partition at once, and only that merge is "
             "marked final, which is what enables ReplacingMergeTree cleanup. Use one of the two mechanisms: "
             "'min_age_to_force_merge_on_partition_only' for partitions that fit into a single merge, "
             "'min_partition_age_to_force_merge_seconds' for partitions that do not.");
+    }
+
+    if (merge_selector_algorithm == MergeSelectorAlgorithm::FLUID_LSM
+        && (!(*this)[MergeTreeSetting::merge_selector_fluid_lsm_k].value
+            || !(*this)[MergeTreeSetting::merge_selector_fluid_lsm_z].value))
+    {
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Settings 'merge_selector_fluid_lsm_k' and 'merge_selector_fluid_lsm_z' must be positive integers "
+            "when 'merge_selector_algorithm' is 'FluidLSM'");
     }
 
     // Zero index_granularity is nonsensical.

@@ -10,6 +10,7 @@ enum class MergeSelectorAlgorithm : uint8_t
     STOCHASTIC_SIMPLE,
     TRIVIAL,
     MANUAL,
+    FLUID_LSM,
 };
 
 }

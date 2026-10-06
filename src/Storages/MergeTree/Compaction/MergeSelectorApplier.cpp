@@ -1,5 +1,6 @@
 #include <Storages/MergeTree/Compaction/MergeSelectorApplier.h>
 #include <Storages/MergeTree/Compaction/MergePredicates/IMergePredicate.h>
+#include <Storages/MergeTree/Compaction/MergeSelectors/FluidLSMMergeSelector.h>
 #include <Storages/MergeTree/Compaction/MergeSelectors/IMergeSelector.h>
 #include <Storages/MergeTree/Compaction/MergeSelectors/ManualMergeSelector.h>
 #include <Storages/MergeTree/Compaction/MergeSelectors/SimpleMergeSelector.h>
@@ -33,6 +34,8 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsFloat merge_selector_base;
     extern const MergeTreeSettingsUInt64 min_parts_to_merge_at_once;
     extern const MergeTreeSettingsBool apply_patches_on_merge;
+    extern const MergeTreeSettingsUInt64 merge_selector_fluid_lsm_k;
+    extern const MergeTreeSettingsUInt64 merge_selector_fluid_lsm_z;
 }
 
 namespace
@@ -159,6 +162,24 @@ SimpleMergeSelector::Settings fillSimpleStochasticSettings(const ChooseContext &
     return simple_merge_settings;
 }
 
+FluidLSMMergeSelector::Settings fillFluidLSMSettings(const ChooseContext & ctx)
+{
+    FluidLSMMergeSelector::Settings fluid_lsm_settings;
+
+    fluid_lsm_settings.max_parts_to_merge_at_once = ctx.merge_tree_settings[MergeTreeSetting::max_parts_to_merge_at_once];
+    fluid_lsm_settings.max_parts_at_lower_levels = ctx.merge_tree_settings[MergeTreeSetting::merge_selector_fluid_lsm_k];
+    fluid_lsm_settings.max_parts_at_largest_level = ctx.merge_tree_settings[MergeTreeSetting::merge_selector_fluid_lsm_z];
+    fluid_lsm_settings.simple = fillSimpleSettings(ctx);
+    fluid_lsm_settings.min_partition_age_to_force_merge = ctx.merge_tree_settings[MergeTreeSetting::min_partition_age_to_force_merge_seconds];
+    fluid_lsm_settings.partitions_stats = &ctx.partitions_stats;
+    fluid_lsm_settings.aggressive = ctx.aggressive;
+
+    if (!ctx.merge_tree_settings[MergeTreeSetting::min_age_to_force_merge_on_partition_only])
+        fluid_lsm_settings.min_age_to_force_merge = ctx.merge_tree_settings[MergeTreeSetting::min_age_to_force_merge_seconds];
+
+    return fluid_lsm_settings;
+}
+
 MergeSelectorChoices tryChooseRegularMerge(const ChooseContext & ctx)
 {
     const auto algorithm = ctx.merge_tree_settings[MergeTreeSetting::merge_selector_algorithm];
@@ -177,6 +198,9 @@ MergeSelectorChoices tryChooseRegularMerge(const ChooseContext & ctx)
             break;
         case MergeSelectorAlgorithm::MANUAL:
             selector = std::make_shared<ManualMergeSelector>(ctx.storage_id);
+            break;
+        case MergeSelectorAlgorithm::FLUID_LSM:
+            selector = std::make_shared<FluidLSMMergeSelector>(fillFluidLSMSettings(ctx));
             break;
     }
 

@@ -405,7 +405,8 @@ IMPLEMENT_SETTING_ENUM(
     {{"Simple", MergeSelectorAlgorithm::SIMPLE},
      {"StochasticSimple", MergeSelectorAlgorithm::STOCHASTIC_SIMPLE},
      {"Trivial", MergeSelectorAlgorithm::TRIVIAL},
-     {"Manual", MergeSelectorAlgorithm::MANUAL}})
+     {"Manual", MergeSelectorAlgorithm::MANUAL},
+     {"FluidLSM", MergeSelectorAlgorithm::FLUID_LSM}})
 
 IMPLEMENT_SETTING_ENUM(
     DatabaseDataLakeCatalogType,
