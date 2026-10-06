@@ -1,0 +1,119 @@
+---
+description: 'How ClickHouse chooses which parts to merge in the background, and the available merge selector algorithms.'
+sidebarTitle: 'Merge Selectors'
+slug: /engines/table-engines/mergetree-family/merge-selectors
+title: 'Merge selector algorithms'
+doc_type: 'reference'
+---
+
+Insert operations into `MergeTree`-family tables create a new data part each time.
+A background process periodically merges existing parts into bigger ones, which
+bounds the number of parts a query has to open and removes data made obsolete by
+engines such as `ReplacingMergeTree`.
+
+The [`merge_selector_algorithm`](/reference/settings/merge-tree-settings/merge-selector#merge_selector_algorithm)
+table setting chooses the algorithm that picks which parts to merge. Merging
+more eagerly lowers the number of parts at the cost of higher write
+amplification, and the algorithms below strike that trade-off differently.
+
+## Simple {#merge-selectors-simple}
+
+The default. `Simple` slides a window over the parts of a partition and allows a
+merge when the total size of the range is at least `merge_selector_base` times
+the size of its largest part; the base is lowered as parts age or the partition
+fills up.
+
+`Simple` does not know about merge levels: the number of parts per level is
+emergent rather than bounded, and the size-ratio check discourages merging a
+small part into a much larger one until the parts are old enough or `OPTIMIZE`
+is run.
+
+## StochasticSimple {#merge-selectors-stochastic-simple}
+
+A variant of `Simple` that slides the merge window stochastically, controlled by
+`merge_selector_blurry_base_scale_factor`.
+
+## Trivial {#merge-selectors-trivial}
+
+Merges a fixed number of parts at a time. Mainly useful for testing.
+
+## Manual {#merge-selectors-manual}
+
+Disables background merge selection; merges are scheduled explicitly with
+`SYSTEM MERGE` queries.
+
+## FluidLSM {#merge-selectors-fluid-lsm}
+
+`FluidLSM` implements the Fluid LSM-tree merge policy from the Dostoevsky paper:
+
+> Niv Dayan, Stratos Idreos. "Dostoevsky: Better Space-Time Trade-Offs for
+> LSM-Tree Based Key-Value Stores via Adaptive Removal of Superfluous Merging",
+> SIGMOD'18. https://doi.org/10.1145/3183713.3196927
+
+The paper observes that in an LSM-tree the I/O cost of a write is paid equally
+at all levels through the merges it participates in, while the cost of lookups
+and the space amplification derive mostly from the largest level. Merging at
+all levels but the largest is therefore mostly "superfluous", and removing it
+improves write cost without hurting read cost or space amplification.
+
+In ClickHouse terms, parts are runs and `MergeTreePartInfo::level` - the number
+of merges a part has survived - is the LSM-tree level. A merge of parts at level
+`l` produces a part at level `l + 1`, so levels below the top play the role of
+the smaller LSM-tree levels. `FluidLSM` keeps at most `K` parts
+(`merge_selector_fluid_lsm_k`, default 9) at each level below the largest
+occupied level and at most `Z` parts (`merge_selector_fluid_lsm_z`,
+default 20) at the largest level, and schedules a merge when a level
+overflows its bound:
+
+- `K = 1` and `Z = 1` approximates leveling: every incoming part is merged into
+  the existing parts of its level as soon as possible.
+- Large `K` and large `Z` approximates tiering: parts accumulate and merge only
+  when a level is full.
+- `K > 1` and `Z = 1` is "Lazy Leveling": tiering at all levels but the
+  largest, and leveling at the largest level.
+
+The default `Z` is above 1: merging the largest parts is the most expensive
+merging, and under a merge backlog an eagerly leveled top can starve the
+background pool while fresh parts pile up. Keeping up to `Z` parts at the
+top costs little on the read side - queries read all parts of a partition
+regardless - and reduces merge work substantially. Set `Z = 1` for full lazy
+leveling: the fewest parts and the least stale data, at the cost of the most
+merge work.
+
+Since a merge produces a level `l + 1` part rather than filling a
+fixed-capacity level, the merge fanout `K + 1` plays the role of the size ratio
+`T` of the paper, and levels grow organically towards the top.
+
+The bounds decide *when* a merge is scheduled; `Simple` decides *what* is
+merged: when a lower level overflows, the whole partition is delegated to the
+`Simple` selector, so under a merge backlog it picks the same wide, possibly
+cross-level windows it would pick itself, while under light load the
+overflowing run is usually the only window that qualifies. If the scan finds
+nothing - for example when the overflowing run is too small to pass the ratio
+check - the same-level run is merged so a level can never be stuck over its
+bound. An overflow of the largest level is merged directly as windows
+covering `Z` + 1 largest-level parts, sweeping any lower-level parts between
+them; in that case the partition is not delegated to `Simple` - its windows
+could overlap the swept parts - but overflowing lower-level runs disjoint
+from the sweep are still merged, so they cannot pile up behind a stalled
+largest-level merge.
+
+Compared to `Simple`:
+
+- `FluidLSM` guarantees a worst-case bound of about `K * L + Z` parts per
+  partition instead of an emergent part count.
+- Lower levels merge only once they fill up, lowering write amplification.
+- `Z` tunes how eagerly the largest level compacts, which is the merge work
+  that actually bounds the number of parts and the amount of outdated data a
+  query sees.
+
+Analytical queries read all parts of a partition regardless of how the parts
+were merged, so the lazier lower levels are close to free on the read side; the
+expected benefit is lower write amplification and a tighter bound on the number
+of parts. The selector is opt-in and experimental.
+
+The parts of the Dostoevsky design that do not map to `MergeTree` are not
+implemented: there is no per-level Bloom filter allocation (ClickHouse uses a
+sparse primary index rather than per-run Bloom filters probed by point
+lookups), and `K`/`Z` are static table settings rather than being tuned
+automatically from the workload.
